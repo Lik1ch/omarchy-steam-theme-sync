@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Generate a Millennium theme that recolors Steam with the active Omarchy palette.
+
+Steam's UI hard-codes most of its colors, so instead of overriding variables
+this reads Steam's own stylesheets, finds every declaration that uses one of
+Steam's neutral backgrounds, grey text colors or its blue accent, and emits the
+same selector/property with the matching Omarchy color. Rules keep Steam's
+order, so hover/active states still win the way they do in stock Steam.
+Saturated colors (achievements, red/green badges) and pure white/black are left
+untouched.
+
+Usage: steam-theme-sync              regenerate the theme
+       steam-theme-sync --activate   also select it in Millennium (close Steam first)
+       steam-theme-sync --remove     delete the generated theme
+
+Part of the Omarchy plugin "Steam Theme Sync". MIT licensed.
+"""
+import colorsys
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HOME = Path.home()
+
+
+def find_steam():
+    for candidate in (HOME / ".local/share/Steam", HOME / ".steam/steam"):
+        if (candidate / "steamui/css").is_dir():
+            return candidate.resolve()
+    return None
+
+
+STEAM = find_steam() or (HOME / ".local/share/Steam")
+CSS_DIR = STEAM / "steamui/css"
+# sp.css is the main client stylesheet; chunk~<hash>.css changes name between
+# Steam builds, so it is globbed rather than named.
+STEAMUI_CSS = [CSS_DIR / "sp.css", CSS_DIR / "library.css", *sorted(CSS_DIR.glob("chunk~*.css"))]
+THEME_DIR = STEAM / "millennium/themes/omarchy"
+PALETTE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy/current/theme/colors.toml"
+MILLENNIUM_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "millennium/config.json"
+
+COLOR_PROPS = {
+    "background", "background-color", "color", "border", "border-color",
+    "border-top", "border-bottom", "border-left", "border-right",
+    "border-top-color", "border-bottom-color", "border-left-color",
+    "border-right-color", "outline", "outline-color", "fill", "stroke",
+    "background-image", "caret-color", "text-decoration-color",
+}
+COLOR_RE = re.compile(r"#[0-9a-fA-F]{8}\b|#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b|rgba?\([^)]*\)")
+
+
+# ---------------------------------------------------------------- colors
+
+def parse_color(tok):
+    tok = tok.strip()
+    if tok.startswith("#"):
+        h = tok[1:]
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        a = int(h[6:8], 16) / 255 if len(h) == 8 else None
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), a
+    nums = re.findall(r"[\d.]+%?", tok)
+    if len(nums) < 3:
+        return None
+    try:
+        rgb = [float(n[:-1]) * 2.55 if n.endswith("%") else float(n) for n in nums[:3]]
+        a = float(nums[3].rstrip("%")) / (100 if nums[3].endswith("%") else 1) if len(nums) > 3 else None
+    except ValueError:
+        return None
+    return int(round(rgb[0])), int(round(rgb[1])), int(round(rgb[2])), a
+
+
+def hex_rgb(s):
+    s = s.strip().lstrip("#")
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def mix(c1, c2, t):
+    return tuple(round(a + (b - a) * t) for a, b in zip(c1, c2))
+
+
+def fmt(rgb, alpha):
+    if alpha is None or alpha >= 0.999:
+        return "#%02x%02x%02x" % rgb
+    return "rgba(%d,%d,%d,%s)" % (*rgb, ("%.3f" % alpha).rstrip("0").rstrip("."))
+
+
+def ramp(anchors, x):
+    """Piecewise-linear interpolation over [(position, rgb), ...]."""
+    if x <= anchors[0][0]:
+        return anchors[0][1]
+    for (p0, c0), (p1, c1) in zip(anchors, anchors[1:]):
+        if x <= p1:
+            return mix(c0, c1, (x - p0) / (p1 - p0))
+    return anchors[-1][1]
+
+
+class Mapper:
+    def __init__(self, pal):
+        g = lambda k, d=None: hex_rgb(pal.get(k) or pal.get(d) or "#000000")
+        # Steam lightness -> Omarchy background shades.
+        self.bg = [
+            (0.03, g("darker_background", "background")),
+            (0.08, g("dark_background", "background")),
+            (0.13, g("background")),
+            (0.19, g("lighter_background", "background")),
+            (0.27, g("selection", "background")),
+            (0.40, g("muted", "selection")),
+        ]
+        # Steam grey text lightness -> Omarchy foreground shades.
+        self.fg = [
+            (0.40, g("muted", "dark_foreground")),
+            (0.55, g("bright_foreground", "foreground")),
+            (0.75, g("light_foreground", "foreground")),
+            (0.88, g("foreground")),
+        ]
+        self.accent = g("accent", "blue")
+        self.white = (255, 255, 255)
+        self.black = (0, 0, 0)
+
+    def map(self, r, g_, b, a):
+        h, l, s = colorsys.rgb_to_hls(r / 255, g_ / 255, b / 255)
+        hue = h * 360
+        if l >= 0.97 or l <= 0.02:             # pure white / black: leave
+            return None
+        blueish = 185 <= hue <= 240
+        # Steam's neutrals: greys and its blue-tinted slate greys.
+        if s < 0.12 or (blueish and s < 0.45 and l < 0.42) or (blueish and s < 0.25):
+            if l < 0.42:
+                return fmt(ramp(self.bg, l), a)
+            if l >= 0.40:
+                return fmt(ramp(self.fg, l), a)
+            return None
+        # Steam's blue accent family (#1a9fff, #0099d1, #67c1f5, #2d73ff...).
+        if 190 <= hue <= 230 and s >= 0.55 and 0.30 <= l <= 0.82:
+            base = self.accent
+            if l > 0.62:
+                base = mix(base, self.white, min(0.5, (l - 0.62) * 1.5))
+            elif l < 0.42:
+                base = mix(base, self.black, min(0.4, (0.42 - l) * 2))
+            return fmt(base, a)
+        return None
+
+
+# ---------------------------------------------------------------- css
+
+def iter_rules(css):
+    """Yield (at_prefix, selector, declarations) for each style rule.
+
+    Minimal brace walker for minified CSS: tracks @media/@supports nesting,
+    skips @font-face/@keyframes bodies.
+    """
+    stack = []   # entries: (header, keep)
+    i, n, start = 0, len(css), 0
+    while i < n:
+        c = css[i]
+        if c == "{":
+            header = css[start:i].strip()
+            if header.startswith("@media") or header.startswith("@supports") or header.startswith("@layer"):
+                stack.append((header, True))
+                start = i + 1
+            elif header.startswith("@"):
+                depth, j = 1, i + 1
+                while j < n and depth:
+                    depth += {"{": 1, "}": -1}.get(css[j], 0)
+                    j += 1
+                i, start = j, j
+                continue
+            else:
+                j = css.find("}", i)
+                if j < 0:
+                    return
+                if all(k for _, k in stack):
+                    yield [h for h, _ in stack], header, css[i + 1:j]
+                i, start = j + 1, j + 1
+                continue
+        elif c == "}":
+            if stack:
+                stack.pop()
+            start = i + 1
+        elif c == '"' or c == "'":
+            j = css.find(c, i + 1)
+            i = j if j > 0 else n
+        i += 1
+
+
+def split_decls(block):
+    out, depth, cur = [], 0, []
+    for ch in block:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == ";" and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return [d for d in (x.strip() for x in out) if d]
+
+
+def remap_value(value, mapper, cache):
+    changed = False
+
+    def sub(m):
+        nonlocal changed
+        tok = m.group(0)
+        if tok not in cache:
+            p = parse_color(tok)
+            cache[tok] = mapper.map(*p) if p else None
+        new = cache[tok]
+        if new is None:
+            return tok
+        changed = True
+        return new
+
+    return COLOR_RE.sub(sub, value), changed
+
+
+def generate(mapper):
+    cache, chunks, count = {}, [], 0
+    for path in STEAMUI_CSS:
+        if not path.is_file():
+            continue
+        css = path.read_text(encoding="utf-8", errors="replace")
+        for at, selector, block in iter_rules(css):
+            new_decls = []
+            for decl in split_decls(block):
+                if ":" not in decl:
+                    continue
+                prop, val = decl.split(":", 1)
+                prop = prop.strip().lower()
+                if prop not in COLOR_PROPS and not prop.startswith("--"):
+                    continue
+                new_val, changed = remap_value(val, mapper, cache)
+                if changed:
+                    new_decls.append(f"{prop}:{new_val.strip()}")
+            if new_decls:
+                rule = f"{selector}{{{';'.join(new_decls)}}}"
+                for h in reversed(at):
+                    rule = f"{h}{{{rule}}}"
+                chunks.append(rule)
+                count += 1
+    return "\n".join(chunks), count
+
+
+# ---------------------------------------------------------------- output
+
+# Runs inside every themed Steam window. Millennium injects the theme CSS as
+# <link id="millennium-injected"> and only re-reads it on Steam start, so this
+# polls version.txt next to the CSS and swaps the link's URL when it changes.
+LIVE_RELOAD_JS = r"""
+(() => {
+  if (window.__omarchySteamLive) return;
+  window.__omarchySteamLive = true;
+  const isOurs = (l) => /\.custom\.css(\?|$)/.test(l.href) && /omarchy/i.test(l.href);
+  const links = () => [...document.querySelectorAll('link[rel="stylesheet"]')].filter(isOurs);
+  let current = null;
+  const versionUrl = (l) => l.href.replace(/[^/]*\.custom\.css(\?.*)?$/, "version.txt");
+  async function tick() {
+    const ls = links();
+    if (!ls.length) return;
+    try {
+      const r = await fetch(versionUrl(ls[0]) + "?t=" + Date.now(), { cache: "no-store" });
+      if (!r.ok) return;
+      const v = (await r.text()).trim();
+      if (current === null) { current = v; return; }
+      if (v && v !== current) {
+        current = v;
+        for (const l of ls) {
+          const fresh = l.cloneNode();
+          fresh.href = l.href.replace(/\?.*$/, "") + "?v=" + v;
+          fresh.onload = () => l.remove();
+          l.after(fresh);
+        }
+      }
+    } catch (e) { /* Steam closing or file mid-write: try again next tick */ }
+  }
+  setInterval(tick, 2000);
+  tick();
+})();
+"""
+
+def write_theme(css, pal):
+    THEME_DIR.mkdir(parents=True, exist_ok=True)
+    skin = {
+        "name": "Omarchy",
+        "author": "Steam Theme Sync",
+        "description": "Steam recolored with the active Omarchy theme (generated by the Steam Theme Sync Omarchy plugin).",
+        "version": "1.0.0",
+        "UseDefaultPatches": True,
+    }
+    stamp = str(time.time_ns())
+    (THEME_DIR / "skin.json").write_text(json.dumps(skin, indent=2) + "\n")
+    header = f"/* Generated by steam-theme-sync from {PALETTE} - do not edit - {stamp} */\n"
+    for name in ("libraryroot.custom.css", "friends.custom.css", "bigpicture.custom.css"):
+        tmp = THEME_DIR / (name + ".tmp")
+        tmp.write_text(header + css + "\n")
+        tmp.replace(THEME_DIR / name)
+    for name in ("libraryroot.custom.js", "friends.custom.js", "bigpicture.custom.js"):
+        (THEME_DIR / name).write_text(LIVE_RELOAD_JS)
+    # Written last: the live-reload script reloads the CSS when this changes.
+    (THEME_DIR / "version.txt").write_text(stamp + "\n")
+    sig = hashlib.sha256("".join(str(p.stat().st_mtime_ns) for p in STEAMUI_CSS if p.exists()).encode()).hexdigest()
+    (THEME_DIR / ".source-signature").write_text(sig + "\n")
+
+
+def activate():
+    try:
+        cfg = json.loads(MILLENNIUM_CONFIG.read_text())
+    except (OSError, ValueError):
+        print("Millennium config not found; select the theme in Steam > Millennium > Themes.", file=sys.stderr)
+        return
+    cfg.setdefault("themes", {})["activeTheme"] = "omarchy"
+    tmp = MILLENNIUM_CONFIG.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp.replace(MILLENNIUM_CONFIG)
+
+
+def main():
+    if "--remove" in sys.argv:
+        shutil.rmtree(THEME_DIR, ignore_errors=True)
+        print(f"steam-theme-sync: removed {THEME_DIR}")
+        return 0
+    if not CSS_DIR.is_dir():
+        print("steam-theme-sync: Steam not found, nothing to do", file=sys.stderr)
+        return 0
+    if not (STEAM / "millennium").is_dir():
+        print("steam-theme-sync: Millennium not installed or Steam not started with it yet", file=sys.stderr)
+        return 0
+    try:
+        pal = tomllib.loads(PALETTE.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        print(f"cannot read palette: {e}", file=sys.stderr)
+        return 1
+    css, count = generate(Mapper(pal))
+    write_theme(css, pal)
+    print(f"steam-theme-sync: {count} rules, {len(css) // 1024} KiB -> {THEME_DIR}")
+    if "--activate" in sys.argv:
+        activate()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
