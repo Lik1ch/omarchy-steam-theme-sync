@@ -113,21 +113,32 @@ class Mapper:
             (0.27, g("selection", "background")),
             (0.40, g("muted", "selection")),
         ]
-        # Steam grey text lightness -> Omarchy foreground shades.
-        self.fg = [
-            (0.40, g("muted", "dark_foreground")),
-            (0.55, g("bright_foreground", "foreground")),
-            (0.75, g("light_foreground", "foreground")),
-            (0.88, g("foreground")),
-        ]
+        # Text is a blend of the theme's background and foreground, weighted by
+        # how far Steam's grey sits from its own dark background. Using only
+        # these two keys keeps text readable in light and dark themes alike
+        # (light themes reuse names like bright_foreground for pale ANSI colors).
+        self.background = g("background")
+        self.foreground = g("foreground")
+        bl = colorsys.rgb_to_hls(*(c / 255 for c in self.background))[1]
+        self.light = pal.get("mode") == "light" or bl > 0.5
         self.accent = g("accent", "blue")
         self.white = (255, 255, 255)
         self.black = (0, 0, 0)
 
-    def map(self, r, g_, b, a):
+    def text(self, l):
+        # Steam's dimmest secondary text sits near L=0.40, body text near 0.88.
+        # Keep even the dimmest at 62% of the way to the foreground so dates and
+        # captions stay readable on light themes.
+        k = 0.62 + 0.38 * max(0.0, min(1.0, (l - 0.40) / (0.88 - 0.40)))
+        return mix(self.background, self.foreground, k)
+
+    def map(self, r, g_, b, a, is_text=False):
         h, l, s = colorsys.rgb_to_hls(r / 255, g_ / 255, b / 255)
         hue = h * 360
-        if l >= 0.97 or l <= 0.02:             # pure white / black: leave
+        if l >= 0.97:
+            # White text/icons would vanish on a light theme's background.
+            return fmt(self.foreground, a) if (is_text and self.light) else None
+        if l <= 0.02:                          # black: shadows and overlays
             return None
         blueish = 185 <= hue <= 240
         # Steam's neutrals: greys and its blue-tinted slate greys.
@@ -135,7 +146,7 @@ class Mapper:
             if l < 0.42:
                 return fmt(ramp(self.bg, l), a)
             if l >= 0.40:
-                return fmt(ramp(self.fg, l), a)
+                return fmt(self.text(l), a)
             return None
         # Steam's blue accent family (#1a9fff, #0099d1, #67c1f5, #2d73ff...).
         if 190 <= hue <= 230 and s >= 0.55 and 0.30 <= l <= 0.82:
@@ -206,16 +217,20 @@ def split_decls(block):
     return [d for d in (x.strip() for x in out) if d]
 
 
-def remap_value(value, mapper, cache):
+TEXT_PROPS = {"color", "fill", "stroke", "caret-color", "text-decoration-color"}
+
+
+def remap_value(value, mapper, cache, is_text=False):
     changed = False
 
     def sub(m):
         nonlocal changed
         tok = m.group(0)
-        if tok not in cache:
+        key = (tok, is_text)
+        if key not in cache:
             p = parse_color(tok)
-            cache[tok] = mapper.map(*p) if p else None
-        new = cache[tok]
+            cache[key] = mapper.map(*p, is_text=is_text) if p else None
+        new = cache[key]
         if new is None:
             return tok
         changed = True
@@ -239,7 +254,7 @@ def generate(mapper):
                 prop = prop.strip().lower()
                 if prop not in COLOR_PROPS and not prop.startswith("--"):
                     continue
-                new_val, changed = remap_value(val, mapper, cache)
+                new_val, changed = remap_value(val, mapper, cache, prop in TEXT_PROPS)
                 if changed:
                     new_decls.append(f"{prop}:{new_val.strip()}")
             if new_decls:
